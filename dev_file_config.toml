@@ -1,0 +1,24 @@
+[destinations.foo]
+path = "/home/traxys/Documents/junk/foo"
+params = {user = "traxys"}
+actions = ["chown"]
+
+[destinations.bar]
+path = "/home/traxys/Documents/junk/bar"
+params = {user = "root"}
+actions = ["chown", "echo_name"]
+
+[sources.source-1]
+path = "/home/traxys/Documents/junk/source_1"
+
+[sources.source-2]
+path = "/home/traxys/Documents/junk/source_2"
+
+[actions.chown]
+command = "chown #user !path"
+params = ["user"]
+infos = ["path"]
+
+[actions.echo_name]
+command = "echo \"!name moved to !path\""
+infos = ["name", "path"]
