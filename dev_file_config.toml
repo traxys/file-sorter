@@ -1,3 +1,10 @@
+secret = "test_plz_change"
+expiry = 10000000000
+
+[users.traxys]
+password = "123"
+sources = ["source-1"]
+
 [destinations.foo]
 path = "/home/traxys/Documents/junk/foo"
 params = {user = "traxys"}
@@ -22,3 +29,4 @@ infos = ["path"]
 [actions.echo_name]
 command = "echo \"!name moved to !path\""
 infos = ["name", "path"]
+

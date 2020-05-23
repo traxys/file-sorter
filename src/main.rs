@@ -1,9 +1,13 @@
 #![feature(proc_macro_hygiene, decl_macro)]
 use log::error;
-use rocket::{fairing::AdHoc, State};
+use rocket::{
+    fairing::AdHoc,
+    request::{FromRequest, Outcome, Request},
+    State,
+};
 use rocket_contrib::json::Json;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -21,8 +25,11 @@ pub enum ErrorKind {
     IoError,
     SourceNotFound(String),
     DestinationNotFound(String),
+    DestinationExists(String),
     MoveFailed,
     CommandFailed,
+    InternalError,
+    UnknownUser,
 }
 impl ErrorKind {
     fn code(&self) -> u64 {
@@ -32,6 +39,9 @@ impl ErrorKind {
             Self::DestinationNotFound(_) => 2,
             Self::MoveFailed => 3,
             Self::CommandFailed => 4,
+            Self::InternalError => 5,
+            Self::UnknownUser => 6,
+            Self::DestinationExists(_) => 7,
         }
     }
 }
@@ -82,6 +92,117 @@ fn err<T>(error: ErrorKind) -> JsonResult<T> {
     Json(Response::from(Err(SorterError::from(error))))
 }
 
+#[derive(Debug)]
+enum AuthError {
+    GuardFetch,
+    InvalidAuthorization,
+    TokenExpired,
+}
+#[derive(Debug)]
+struct User {
+    name: String,
+}
+
+impl<'a, 'r> FromRequest<'a, 'r> for User {
+    type Error = AuthError;
+    fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+        let secret = request
+            .guard::<State<Secret>>()
+            .map_failure(|(s, _)| (s, AuthError::GuardFetch))?;
+
+        let auth = match request.headers().get_one("Authorization") {
+            Some(a) => a,
+            None => {
+                return rocket::Outcome::Failure((
+                    rocket::http::Status::BadRequest,
+                    AuthError::InvalidAuthorization,
+                ))
+            }
+        };
+        if !auth.starts_with("Bearer") {
+            error!("Authorization does not start with Bearer");
+            return rocket::Outcome::Failure((
+                rocket::http::Status::BadRequest,
+                AuthError::InvalidAuthorization,
+            ));
+        }
+        let auth = auth.trim_start_matches("Bearer").trim_start();
+        let decoded = match jsonwebtoken::decode::<Claims>(
+            auth,
+            &secret.jwt_key,
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+        ) {
+            Err(e) => {
+                error!("Could not decode JWT: {:?}", e);
+                return rocket::Outcome::Failure((
+                    rocket::http::Status::BadRequest,
+                    AuthError::InvalidAuthorization,
+                ));
+            }
+            Ok(d) => d,
+        };
+        if decoded.claims.iat + chrono::Duration::seconds(decoded.claims.exp as i64)
+            < chrono::Utc::now()
+        {
+            return rocket::Outcome::Failure((
+                rocket::http::Status::Unauthorized,
+                AuthError::TokenExpired,
+            ));
+        }
+        Outcome::Success(User {
+            name: decoded.claims.sub,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Login {
+    password: String,
+    username: String,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct LoginResult {
+    token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+    iat: chrono::DateTime<chrono::Utc>,
+}
+
+#[post("/login", data = "<login>")]
+fn login(
+    login: Json<Login>,
+    secret: State<Secret>,
+    users: State<Users>,
+) -> JsonResult<LoginResult> {
+    let login = login.into_inner();
+    if let None | Some(false) = users
+        .users
+        .get(&login.username)
+        .map(|details| details.password == login.password)
+    {
+        return err(ErrorKind::UnknownUser);
+    };
+
+    let claims = Claims {
+        sub: login.username,
+        exp: secret.exp,
+        iat: chrono::Utc::now(),
+    };
+    let token =
+        match jsonwebtoken::encode(&jsonwebtoken::Header::default(), &claims, &secret.jwt_key) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("Error encoding token: {:?}", e);
+                return err(ErrorKind::InternalError);
+            }
+        };
+    resp(LoginResult { token })
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct File {
     source: String,
@@ -119,18 +240,35 @@ fn list_files_source(name: String, source: &Source) -> Result<Vec<File>, ErrorKi
 }
 
 #[get("/files")]
-fn list_files(sources: State<Sources>) -> JsonResult<Files> {
+fn list_files(user: User, sources: State<Sources>, users: State<Users>) -> JsonResult<Files> {
+    let details = users.users.get(&user.name).unwrap();
     let mut files = Vec::new();
     for (name, source) in &sources.sources {
-        files.append(&mut match list_files_source(name.clone(), source) {
-            Ok(f) => f,
-            Err(e) => return err(e),
-        })
+        if details.sources.contains(name) {
+            files.append(&mut match list_files_source(name.clone(), source) {
+                Ok(f) => f,
+                Err(e) => return err(e),
+            })
+        }
     }
     resp(Files { files })
 }
 #[get("/files/<source>")]
-fn list_files_in_source(source: String, sources: State<Sources>) -> JsonResult<Files> {
+fn list_files_in_source(
+    source: String,
+    sources: State<Sources>,
+    users: State<Users>,
+    user: User,
+) -> JsonResult<Files> {
+    if !users
+        .users
+        .get(&user.name)
+        .unwrap()
+        .sources
+        .contains(&source)
+    {
+        return err(ErrorKind::SourceNotFound(source));
+    }
     match sources.sources.get(&source) {
         None => err(ErrorKind::SourceNotFound(source)),
         Some(s) => match list_files_source(source, s) {
@@ -147,7 +285,19 @@ fn move_file(
     destination: String,
     sources: State<Sources>,
     destinations: State<Destinations>,
+    user: User,
+    users: State<Users>,
 ) -> JsonResult<()> {
+    if !users
+        .users
+        .get(&user.name)
+        .unwrap()
+        .sources
+        .contains(&source)
+    {
+        return err(ErrorKind::SourceNotFound(source));
+    }
+
     let source_name = source;
     let source = match sources.sources.get(&source_name) {
         Some(s) => s,
@@ -163,6 +313,9 @@ fn move_file(
     };
     let mut destination_file = destination.path.clone();
     destination_file.push(&file);
+    if destination_file.exists() {
+        return err(ErrorKind::DestinationExists(file));
+    }
     if let Err(e) = std::fs::rename(source_file, &destination_file) {
         error!("Could not move file to {:?}: {:?}", destination_file, e);
         return err(ErrorKind::MoveFailed);
@@ -202,7 +355,7 @@ fn move_file(
                 Ok(o) => o,
                 Err(e) => {
                     eprintln!("Can't run action {}: {:?}", base, e);
-                    return err(ErrorKind::CommandFailed)
+                    return err(ErrorKind::CommandFailed);
                 }
             };
             dbg!(output);
@@ -245,12 +398,30 @@ struct Destinations {
 struct Sources {
     sources: HashMap<String, Source>,
 }
+#[derive(Debug, Serialize, Deserialize)]
+struct UserDetails {
+    password: String,
+    sources: HashSet<String>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct Users {
+    users: HashMap<String, UserDetails>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Secret {
+    jwt_key: Vec<u8>,
+    exp: usize,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
     destinations: HashMap<String, Destination>,
     sources: HashMap<String, Source>,
     actions: HashMap<String, Action>,
+    users: HashMap<String, UserDetails>,
+    secret: String,
+    expiry: usize,
 }
 
 fn validate_destinations(
@@ -313,7 +484,10 @@ fn parse_config(path: impl AsRef<std::path::Path>) -> Result<Config, ()> {
 
 fn main() {
     rocket::ignite()
-        .mount("/", routes![list_files, list_files_in_source, move_file])
+        .mount(
+            "/",
+            routes![list_files, list_files_in_source, move_file, login],
+        )
         .attach(AdHoc::on_attach("File Config", |rocket| {
             let config = rocket
                 .config()
@@ -329,6 +503,13 @@ fn main() {
                         .manage(Destinations {
                             destinations: config.destinations,
                             actions: config.actions,
+                        })
+                        .manage(Users {
+                            users: config.users,
+                        })
+                        .manage(Secret {
+                            jwt_key: config.secret.as_bytes().to_owned(),
+                            exp: config.expiry,
                         })),
                     Err(_) => Err(rocket),
                 },
