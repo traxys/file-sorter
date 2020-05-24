@@ -1,4 +1,5 @@
 #![feature(proc_macro_hygiene, decl_macro)]
+use bstr::ByteSlice;
 use log::error;
 use rocket::{
     fairing::AdHoc,
@@ -30,6 +31,7 @@ pub enum ErrorKind {
     CommandFailed,
     InternalError,
     UnknownUser,
+    SourceDoesNotExists(String),
 }
 impl ErrorKind {
     fn code(&self) -> u64 {
@@ -42,6 +44,7 @@ impl ErrorKind {
             Self::InternalError => 5,
             Self::UnknownUser => 6,
             Self::DestinationExists(_) => 7,
+            Self::SourceDoesNotExists(_) => 8,
         }
     }
 }
@@ -305,6 +308,9 @@ fn move_file(
     };
     let mut source_file = source.path.clone();
     source_file.push(&file);
+    if !source_file.exists() {
+        return err(ErrorKind::SourceDoesNotExists(file));
+    }
 
     let destination_name = destination;
     let destination = match destinations.destinations.get(&destination_name) {
@@ -358,7 +364,12 @@ fn move_file(
                     return err(ErrorKind::CommandFailed);
                 }
             };
-            dbg!(output);
+            if !output.stderr.is_empty() {
+                log::warn!("Action {} failed: {}", action_name, output.stderr.as_bstr());
+            }
+            if !output.stdout.is_empty() {
+                println!("Action {}: {}", action_name, output.stdout.as_bstr());
+            }
         }
     }
     resp(())
