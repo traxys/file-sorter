@@ -214,10 +214,10 @@ struct File {
 }
 #[derive(Serialize, Deserialize, Debug)]
 struct Files {
-    files: Vec<File>,
+    files: HashMap<String, Vec<PathBuf>>,
 }
 
-fn list_files_source(name: String, source: &Source) -> Result<Vec<File>, ErrorKind> {
+fn list_files_source(name: &str, source: &Source) -> Result<Vec<PathBuf>, ErrorKind> {
     let mut files = Vec::new();
     match std::fs::read_dir(&source.path) {
         Err(e) => {
@@ -231,10 +231,9 @@ fn list_files_source(name: String, source: &Source) -> Result<Vec<File>, ErrorKi
                         error!("Error reading source {}: {:?}", name, e);
                         Err(ErrorKind::IoError)?;
                     }
-                    Ok(entry) => files.push(File {
-                        source: name.clone(),
-                        name: entry.path().strip_prefix(&source.path).unwrap().to_owned(),
-                    }),
+                    Ok(entry) => {
+                        files.push(entry.path().strip_prefix(&source.path).unwrap().to_owned())
+                    }
                 }
             }
         }
@@ -246,13 +245,17 @@ fn list_files_source(name: String, source: &Source) -> Result<Vec<File>, ErrorKi
 #[get("/files")]
 fn list_files(user: User, sources: State<Sources>, users: State<Users>) -> JsonResult<Files> {
     let details = users.users.get(&user.name).unwrap();
-    let mut files = Vec::new();
+    let mut files = HashMap::new();
     for (name, source) in &sources.sources {
         if details.sources.contains(name) {
-            files.append(&mut match list_files_source(name.clone(), source) {
+            let mut files_for_source = match list_files_source(&name, source) {
                 Ok(f) => f,
                 Err(e) => return err(e),
-            })
+            };
+            files
+                .entry(name.into())
+                .or_insert_with(Vec::new)
+                .append(&mut files_for_source);
         }
     }
     resp(Files { files })
@@ -275,9 +278,13 @@ fn list_files_in_source(
     }
     match sources.sources.get(&source) {
         None => err(ErrorKind::SourceNotFound(source)),
-        Some(s) => match list_files_source(source, s) {
+        Some(s) => match list_files_source(&source, s) {
             Err(e) => err(e),
-            Ok(files) => resp(Files { files }),
+            Ok(files) => {
+                let mut map = HashMap::new();
+                map.insert(source, files);
+                resp(Files { files: map })
+            }
         },
     }
 }
@@ -294,6 +301,11 @@ fn list_sources(users: State<Users>, user: User) -> JsonResult<Vec<String>> {
             .cloned()
             .collect(),
     )
+}
+
+#[get("/destinations")]
+fn list_destinations(_user: User, destinations: State<Destinations>) -> JsonResult<Vec<String>> {
+    resp(destinations.destinations.keys().cloned().collect())
 }
 
 #[put("/files/<source>/<file>/<destination>")]
@@ -512,7 +524,7 @@ fn main() -> anyhow::Result<()> {
     let allowed_origins = rocket_cors::AllowedOrigins::all();
     let cors = rocket_cors::CorsOptions {
         allowed_origins,
-        allowed_methods: vec![Method::Get, Method::Post]
+        allowed_methods: vec![Method::Get, Method::Post, Method::Put]
             .into_iter()
             .map(From::from)
             .collect(),
@@ -533,7 +545,8 @@ fn main() -> anyhow::Result<()> {
                 list_files_in_source,
                 move_file,
                 login,
-                list_sources
+                list_sources,
+                list_destinations,
             ],
         )
         .attach(cors)
