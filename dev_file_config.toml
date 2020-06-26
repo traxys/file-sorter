@@ -3,7 +3,7 @@ expiry = 10000000000
 
 [users.traxys]
 password = "123"
-sources = ["source-1"]
+sources = ["source-1", "source-2"]
 
 [destinations.foo]
 path = "/home/traxys/Documents/junk/foo"

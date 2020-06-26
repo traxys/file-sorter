@@ -3,6 +3,7 @@ use bstr::ByteSlice;
 use log::error;
 use rocket::{
     fairing::AdHoc,
+    http::Method,
     request::{FromRequest, Outcome, Request},
     State,
 };
@@ -281,6 +282,20 @@ fn list_files_in_source(
     }
 }
 
+#[get("/sources")]
+fn list_sources(users: State<Users>, user: User) -> JsonResult<Vec<String>> {
+    resp(
+        users
+            .users
+            .get(&user.name)
+            .unwrap()
+            .sources
+            .iter()
+            .cloned()
+            .collect(),
+    )
+}
+
 #[put("/files/<source>/<file>/<destination>")]
 fn move_file(
     source: String,
@@ -493,12 +508,35 @@ fn parse_config(path: impl AsRef<std::path::Path>) -> Result<Config, ()> {
     })
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
+    let allowed_origins = rocket_cors::AllowedOrigins::all();
+    let cors = rocket_cors::CorsOptions {
+        allowed_origins,
+        allowed_methods: vec![Method::Get, Method::Post]
+            .into_iter()
+            .map(From::from)
+            .collect(),
+        allowed_headers: rocket_cors::AllowedHeaders::some(&[
+            "Authorization",
+            "Accept",
+            "Content-Type",
+        ]),
+        ..Default::default()
+    }
+    .to_cors()?;
+
     rocket::ignite()
         .mount(
             "/",
-            routes![list_files, list_files_in_source, move_file, login],
+            routes![
+                list_files,
+                list_files_in_source,
+                move_file,
+                login,
+                list_sources
+            ],
         )
+        .attach(cors)
         .attach(AdHoc::on_attach("File Config", |rocket| {
             let config = rocket
                 .config()
@@ -528,4 +566,6 @@ fn main() {
             }
         }))
         .launch();
+
+    Ok(())
 }

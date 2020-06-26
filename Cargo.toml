@@ -16,3 +16,5 @@ log = "0.4.8"
 jsonwebtoken = {version = "5.0.0" }
 chrono = { version = "0.4.11", features = ["serde"] }
 bstr = "0.2.13"
+rocket_cors = "0.5.2"
+anyhow = "1.0.31"
